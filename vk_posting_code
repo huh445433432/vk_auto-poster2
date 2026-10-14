@@ -1,0 +1,391 @@
+import os ,json ,sys ,time ,random ,re ,random , hashlib , vk_api
+from vk_api.exceptions import ApiError
+
+# === НАСТРОЙКИ ===
+INITIAL_TOKEN = "  "  # ← сюда вставить токен с сайта https://vkhost.github.io/
+GROUP_ID = [  ]   # ← сюда вставить сюда ID групп в ссылке на группу вк скопировать
+HISTORY_FILE = "posted_hashes.json"
+
+# Фильтры (включить/выключить)
+REMOVE_EMOJI = True
+REMOVE_CAPS = True
+FIX_PUNCTUATION = True
+FILTER_SPAM = True
+FILTER_NO_TEXT = True
+FILTER_GIBBERISH = True
+MAX_EMOJI_COUNT = 10  # Максимум эмодзи в посте
+PAUSE_MINUTES = 2 # Пауза между проходами
+
+
+# === УТИЛИТЫ ===
+
+def load_history():
+    """Загружает историю хешей постов"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def save_history(hashes):
+    """Сохраняет историю хешей"""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(hashes), f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить историю: {e}")
+
+
+def get_text_hash(text: str) -> str:
+    """Хеш текста для проверки дублей"""
+    if text is None:
+        text = ""
+    return hashlib.md5(text.strip().lower().encode('utf-8')).hexdigest()
+
+
+def is_duplicate(text: str, history: set) -> bool:
+    """Проверка на дубликат + добавление в историю"""
+    h = get_text_hash(text)
+    if h in history:
+        return True
+    history.add(h)
+    return False
+
+
+# === ФИЛЬТРЫ ===
+
+def remove_emoji(text: str) -> str:
+    """Удаляет эмодзи из текста"""
+    emoji_pattern = re.compile(
+        "[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251"
+        "\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF"
+        "\U0001FAC0-\U0001FAFF]+",
+        flags=re.UNICODE,
+    )
+    return emoji_pattern.sub('', text)
+
+
+def count_emojis(text: str) -> int:
+    """Считает количество эмодзи в тексте"""
+    emoji_pattern = re.compile(
+        "[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251"
+        "\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF"
+        "\U0001FAC0-\U0001FAFF]+",
+        flags=re.UNICODE,
+    )
+    return len(emoji_pattern.findall(text))
+
+
+def is_gibberish(text: str) -> bool:
+    """Проверяет бессмысленный текст"""
+    text = text.strip()
+    if len(text) < 5:
+        return False
+    space_ratio = text.count(" ") / max(len(text), 1)
+    if space_ratio < 0.05:
+        repeats = any(ch * 4 in text for ch in set(text))
+        if repeats:
+            return True
+    return False
+
+
+def is_spam(text: str) -> bool:
+    """Проверка на спам"""
+    stop_words = [
+        "бесплатно", "выигрыш", "кликни", "блять", "сука",
+        "гарантированный доход", "зарабатывай дома", "без вложений",
+        "мгновенный заработок", "победитель", "вам одобрено",
+        "срочный доход", "быстрые деньги", "дополнительный доход",
+        "игровые автоматы", "ставки"
+    ]
+    return any(word in text.lower() for word in stop_words)
+
+
+def has_bad_words(text: str) -> bool:
+    """Проверка на мат/запрещённые слова"""
+    bad_words = ["бля", "хуй", "пизд", "еба", "нахуй", "сука", "пидор"]
+    return any(word in text.lower() for word in bad_words)
+
+
+def process_text(text: str) -> str:
+    """Обработка текста: фильтры и правки"""
+    if text is None:
+        text = ""
+
+    if REMOVE_EMOJI:
+        text = remove_emoji(text)
+
+    if REMOVE_CAPS and text.isupper() and len(text) > 5:
+        text = text.capitalize()
+
+    if FIX_PUNCTUATION:
+        text = " ".join(text.split())
+
+    return text.strip()
+
+
+def check_filters(text: str) -> tuple:
+    """
+    Проверяет текст всеми фильтрами.
+    Возвращает (ok: bool, reason: str)
+    """
+    if not text.strip():
+        return False, "пустой текст"
+
+    if FILTER_SPAM and is_spam(text):
+        return False, "спам"
+
+    if has_bad_words(text):
+            return False, "запрещённые слова"
+
+    if count_emojis(text) > MAX_EMOJI_COUNT:
+            return False, f"слишком много эмодзи ({count_emojis(text)})"
+
+    if FILTER_NO_TEXT and len(text.strip()) < 20:
+            return False, "текст слишком короткий"
+
+    if FILTER_GIBBERISH and is_gibberish(text):
+            return False, "бессмысленный текст"
+
+    return True, "ok"
+
+    # === VK API ФУНКЦИИ ===
+
+def get_author_id(post) -> int:
+        """Определяет ID автора поста"""
+        sid = post.get('signer_id')
+        if isinstance(sid, int) and sid > 0:
+            return sid
+
+        fid = post.get('from_id')
+        if isinstance(fid, int) and fid > 0:
+            return fid
+
+        return None
+
+def get_user_names(vk, user_ids):
+        """Пакетно получает имена пользователей"""
+        valid_ids = [uid for uid in user_ids if isinstance(uid, int) and uid > 0]
+        if not valid_ids:
+            return {}
+
+        try:
+            users = vk.users.get(user_ids=valid_ids, fields='')
+            return {u['id']: f"{u['first_name']} {u['last_name']}" for u in users}
+        except (ApiError, Exception):
+            return {uid: "автор" for uid in valid_ids}
+
+def fetch_suggested_posts(vk, group_id):
+    """Получает предложенные посты группы"""
+    owner_id = -group_id
+    try:
+        response = vk.wall.get(owner_id=owner_id, count=20, filter='suggests')
+        items = response.get('items', [])
+        print(f"✅ Найдено предложенных постов: {len(items)}")
+        return items
+    except ApiError as e:
+        print(f"❌ Ошибка получения постов: {e.code} {e.error_msg}")
+        return []
+
+
+def publish_post(vk, group_id, post, final_text):
+    """
+    Публикует пост с фото и подписью.
+    Фото берутся из attachments поста.
+    """
+    try:
+        owner_id = -group_id
+
+        # Формируем вложения: фото + остальные аттачи
+        attachments = []
+        for att in post.get('attachments', []):
+            att_type = att.get('type')
+            if att_type == 'photo':
+                photo = att['photo']
+                # Берём самый большой размер фото (sizes сортируются по возрастанию)
+                sizes = photo.get('sizes', [])
+                if sizes:
+                    best = max(sizes, key=lambda s: s.get('width', 0) * s.get('height', 0))
+                    attachments.append(f"photo{photo['owner_id']}_{photo['id']}_{photo.get('access_key', '')}")
+            elif att_type == 'video':
+                video = att['video']
+                attachments.append(f"video{video['owner_id']}_{video['id']}_{video.get('access_key', '')}")
+            elif att_type == 'doc':
+                doc = att['doc']
+                attachments.append(f"doc{doc['owner_id']}_{doc['id']}")
+            elif att_type == 'link':
+                link = att['link']
+                attachments.append(link.get('url', ''))
+
+        vk.wall.post(
+            owner_id=owner_id,
+            message=final_text,
+            attachments=attachments,  # ← ВАЖНО: прикрепляем фото и другие вложения
+        )
+        return True
+    except ApiError as e:
+        print(f"  ❌ Ошибка публикации: {e.code} {e.error_msg}")
+        return False
+
+
+def delete_suggested_post(vk, group_id, post_id):
+    """Удаляет предложенный пост из очереди"""
+    try:
+        owner_id = -group_id
+        vk.wall.delete(owner_id=owner_id, post_id=post_id)
+        return True
+    except ApiError as e:
+        print(f"  ⚠️ Не удалось удалить предложенный пост {post_id}: {e.code} {e.error_msg}")
+        return False
+
+def process_group(vk, group_id, history):
+    """Обрабатывает одну группу"""
+    print(f"\n🏢 Обработка группы: {group_id}")
+    posts = fetch_suggested_posts(vk, group_id)
+
+    if not posts:
+        print("✅ Нет предложенных записей для этой группы")
+        return
+
+    # Собираем авторов для пакетного запроса имён
+    author_ids = [get_author_id(p) for p in posts if get_author_id(p)]
+    user_names = get_user_names(vk, author_ids)
+
+    approved = []
+    rejected = []
+    duplicates = []
+
+    for post in posts:
+        post_id = post['id']
+        raw_text = post.get('text', '')
+
+        # Проверка на дубликат
+        if is_duplicate(raw_text, history):
+            duplicates.append(post)
+            print(f"⚠️ Дубликат пропущен: {post_id}")
+            continue
+
+        # Проверка всех фильтров
+        ok, reason = check_filters(raw_text)
+        if not ok:
+            rejected.append((post, reason))
+            print(f"❌ [{reason}] Пост {post_id} отклонён")
+            continue
+
+        # Обработка текста (удаление эмодзи, капса, лишних пробелов)
+        new_text = process_text(raw_text)
+        approved.append((post, new_text))
+
+    print(f"\n📊 Статистика для группы {group_id}:")
+    print(f"  ✅ Пройдут публикацию: {len(approved)}")
+    print(f"  🚫 Будет отклонено: {len(rejected)}")
+    print(f"  🔁 Дубликаты: {len(duplicates)}")
+
+    # Удаляем дубликаты
+    for post in duplicates:
+        delete_suggested_post(vk, group_id, post['id'])
+        print(f"  🗑️ Дубликат удалён: {post['id']}")
+        time.sleep(0.35)
+
+    # Публикуем принятые посты
+    if approved:
+        print(f"\n📝 Публикация в группе {group_id}...")
+        published = 0
+        failed = 0
+
+        # Получаем имена авторов для подписей ОДИН РАЗ
+        all_author_ids = [get_author_id(p[0]) for p in approved if get_author_id(p[0])]
+        user_names_cache = get_user_names(vk, all_author_ids)
+
+        for i, (post, new_text) in enumerate(approved, 1):
+            post_id = post['id']
+            print(f"📍 Пост {i}/{len(approved)} (ID: {post_id})")
+
+            # Формируем подпись автора
+            author_id = get_author_id(post)
+            signature = ""
+            if author_id and user_names_cache.get(author_id):
+                name = user_names_cache[author_id]
+                signature = f"\n\n⭐ Предложил: [id{author_id}|{name}]"
+                print(f"👤 Автор: {name}")
+            else:
+                print("👤 Автор не определён (подпись не будет добавлена)")
+
+            final_text = new_text + signature
+
+            # Публикуем с фото и подписью
+            success = publish_post(vk, group_id, post, final_text)
+
+            if success:
+                if delete_suggested_post(vk, group_id, post_id):
+                    print(f"✅ Опубликовано и удалено: {post_id}")
+                else:
+                    print(f"⚠️ Опубликовано, но не удалено из очереди: {post_id}")
+                published += 1
+            else:
+                print(f"❌ Не удалось опубликовать: {post_id}")
+                failed += 1
+
+            # Пауза между постами (кроме последнего)
+            if i < len(approved):
+                delay = random.uniform(90, 180)  # 1.5 - 3 минуты
+                print(f"  ⏱ Пауза {delay / 60:.1f} мин...")
+                time.sleep(delay)
+
+        print(f"\n📊 Итог для группы {group_id}: опубликовано {published}, ошибок {failed}")
+
+    # Отклоняем оставшиеся (спам, мусор)
+    if rejected:
+        print(f"\n🗑️ Отклоняю {len(rejected)} записей в группе {group_id}...")
+        for post, reason in rejected:
+            try:
+                if delete_suggested_post(vk, group_id, post['id']):
+                    print(f"  🗑️ Удалено: {post['id']} (причина: {reason})")
+                else:
+                    print(f"  ⚠️ Не удалось отклонить: {post['id']}")
+                time.sleep(0.35)
+            except Exception as e:
+                print(f"  ❌ Ошибка при отклонении {post['id']}: {e}")
+
+def main_loop():
+        """Главный бесконечный цикл"""
+        print("🚀 Запуск обработки предложенных постов")
+        print("❗ Для остановки нажмите Ctrl+C")
+        print("=" * 60)
+
+        # Загружаем историю дублей один раз
+        history = load_history()
+        print(f"💾 Загружено хешей в истории: {len(history)}")
+
+        iteration = 0
+        while True:
+            iteration += 1
+            print(f"\n{'=' * 60}")
+            print(f"🔁 Проход №{iteration} | {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'=' * 60}")
+
+            vk_session = vk_api.VkApi(token=INITIAL_TOKEN)
+            vk = vk_session.get_api()
+
+            # Обрабатываем все группы
+            for group_id in GROUP_ID:
+                process_group(vk, group_id, history)
+
+            # Сохраняем историю после всех групп
+            save_history(history)
+
+            print(f"\n🌙 Все группы обработаны. Пауза {PAUSE_MINUTES} минут...")
+            time.sleep(PAUSE_MINUTES * 60)
+
+if __name__ == "__main__":
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Скрипт остановлен пользователем (Ctrl+C).")
+        print("💾 История дублей сохранена.")
+        sys.exit(0)
